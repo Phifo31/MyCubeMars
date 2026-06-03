@@ -13,6 +13,8 @@
 #include <ESP32_TWAI.h>
 
 #define BOOT_PUSHBUTTON D9
+#define CAN_TX_PIN  21        
+#define CAN_RX_PIN  22
 
 const float P_MIN = -12.5f;
 const float P_MAX = 12.5f;
@@ -26,11 +28,21 @@ const float Kd_MIN = 0;
 const float Kd_MAX = 5.0f;
 const float Test_Pos = 0.0f;
 
+
 #define CanTxMsg_t CanMsg
 #define CanRxMsg_t CanMsg
 #define can_msg_t CanMsg
 
+
 #define MIT_CAN_ID 99
+
+#define TRANSMIT_RATE_MS 1000
+
+#define POLLING_RATE_MS 1000
+
+static bool driver_installed = false;
+static uint32_t  next_tick = TRANSMIT_RATE_MS;  // will store last time a message was send
+
 
 /**
  * Recup page 36
@@ -342,6 +354,10 @@ void unpack_reply(can_msg_t *rxMessage) {
   }
 }
 
+
+
+
+
 /**
  *
  */
@@ -356,14 +372,46 @@ void setup() {
   Serial.println("\nStart CAN Sender application");
 
   // start the CAN bus at 500 kbps
-  CAN.begin(CanBitRate::BR_500k);
+  // Initialize configuration structures using macro initializers
+  twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT((gpio_num_t)CAN_TX_PIN, (gpio_num_t)CAN_RX_PIN, TWAI_MODE_NORMAL);
+  twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS();  //Look in the api-reference for other speed sets.
+  twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+
+  // Install TWAI driver
+  if (twai_driver_install(&g_config, &t_config, &f_config) == ESP_OK) {
+    Serial.println("Driver installed");
+  } else {
+    Serial.println("Failed to install driver");
+    return;
+  }
+
+  // Start TWAI driver
+  if (twai_start() == ESP_OK) {
+    Serial.println("Driver started");
+  } else {
+    Serial.println("Failed to start driver");
+    return;
+  }
+
+  // Reconfigure alerts to detect TX alerts and Bus-Off errors
+  uint32_t alerts_to_enable = TWAI_ALERT_TX_IDLE | TWAI_ALERT_TX_SUCCESS | TWAI_ALERT_TX_FAILED | TWAI_ALERT_ERR_PASS | TWAI_ALERT_BUS_ERROR;
+  if (twai_reconfigure_alerts(alerts_to_enable, NULL) == ESP_OK) {
+    Serial.println("CAN Alerts reconfigured");
+  } else {
+    Serial.println("Failed to reconfigure alerts");
+    return;
+  }
+
+  // TWAI driver is now successfully installed and started
+  driver_installed = true;
+
 }
 
 typedef enum { APPUYE, RELACHE } state_t;
 /**
  *
  */
-void loop() {
+void loop2() {
   int n = 0;
   state_t state = RELACHE;
   can_msg_t msg;
@@ -373,7 +421,7 @@ void loop() {
     delay(50);
     digitalWrite(LED_BUILTIN, LOW);
     delay(900);
-    Serial.print("Start CAN Sender application loop n°");
+    Serial.print("CAN Sender application loop n°");
     Serial.println(n++);
 
     switch (state) {
@@ -399,6 +447,72 @@ void loop() {
       CanMsg msg = CAN.read();
       Serial.println(msg.getStandardId());
     }
+  }
+}
+
+/**
+ * @brief 
+ * 
+ */
+static void send_message (void) {
+  // Send message
+
+  // Configure message to transmit
+  twai_message_t message;
+  message.identifier = 0x0F6;
+  message.data_length_code = 4;
+  for (int i = 0; i < 4; i++) {
+    message.data[i] = i+30;
+  }
+
+  // Queue message for transmission
+  if (twai_transmit(&message, pdMS_TO_TICKS(1000)) == ESP_OK) {
+    printf("Message queued for transmission\n");
+  } else {
+    printf("Failed to queue message for transmission\n");
+  }
+}
+
+/**
+ * @brief 
+ * 
+ */
+void loop (void) {
+  if (!driver_installed) {
+    // Driver not installed
+    delay(1000);
+    return;
+  }
+  // Check if alert happened
+  uint32_t alerts_triggered;
+  twai_read_alerts(&alerts_triggered, pdMS_TO_TICKS(POLLING_RATE_MS));
+  twai_status_info_t twaistatus;
+  twai_get_status_info(&twaistatus);
+
+  // Handle alerts
+  if (alerts_triggered & TWAI_ALERT_ERR_PASS) {
+    Serial.println("Alert: TWAI controller has become error passive.");
+  }
+  if (alerts_triggered & TWAI_ALERT_BUS_ERROR) {
+    Serial.println("Alert: A (Bit, Stuff, CRC, Form, ACK) error has occurred on the bus.");
+    Serial.printf("Bus error count: %" PRIu32 "\n", twaistatus.bus_error_count);
+  }
+  if (alerts_triggered & TWAI_ALERT_TX_FAILED) {
+    Serial.println("Alert: The Transmission failed.");
+    Serial.printf("TX buffered: %" PRIu32 "\t", twaistatus.msgs_to_tx);
+    Serial.printf("TX error: %" PRIu32 "\t", twaistatus.tx_error_counter);
+    Serial.printf("TX failed: %" PRIu32 "\n", twaistatus.tx_failed_count);
+  }
+  if (alerts_triggered & TWAI_ALERT_TX_SUCCESS) {
+    Serial.println("Alert: The Transmission was successful.");
+    Serial.printf("TX buffered: %" PRIu32 "\t", twaistatus.msgs_to_tx);
+  }
+
+  // Send message
+  uint32_t current_tick = millis();
+  if (current_tick >= next_tick) {
+    next_tick += TRANSMIT_RATE_MS;
+    send_message();
   }
 }
 
